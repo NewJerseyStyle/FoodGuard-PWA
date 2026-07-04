@@ -1,0 +1,1 @@
+{"name":"FoodGuard 食安燈號","short_name":"FoodGuard","description":"依當前身體情境評估食物是否適合食用。","start_url":"./","display":"standalone","background_color":"#f8fafc","theme_color":"#0f766e","lang":"en","scope":"./","icons":[{"src":"icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]}
