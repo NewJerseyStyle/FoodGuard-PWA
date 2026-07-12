@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <!--
   FoodGuard 可行性探針 (SPIKE) — 非正式產品頁，用來驗證 LFM2.5-VL-450M 是否能
   完全在瀏覽器 (WebGPU/WASM, transformers.js) 執行菜單/營養標籤辨識。
@@ -69,10 +69,20 @@
         AutoModelForImageTextToText,
         AutoProcessor,
         RawImage,
+        env,
       } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0";
 
       const MODEL_ID = "LiquidAI/LFM2.5-VL-450M-ONNX";
       const $ = (id) => document.getElementById(id);
+      env.useBrowserCache = true;
+      env.allowRemoteModels = true;
+      env.allowLocalModels = false;
+      const serviceWorkerReady = "serviceWorker" in navigator
+        ? navigator.serviceWorker
+            .register("./sw.js")
+            .then(() => navigator.serviceWorker.ready)
+            .catch(() => null)
+        : Promise.resolve(null);
       const PROMPTS = {
         menu: "List every dish name you can read in this menu image. Output a plain list, one dish per line, no prices or descriptions.",
         label:
@@ -89,32 +99,76 @@
       $("prompt").value = PROMPTS.menu;
 
       let imageURL = null;
+      let imageReady = false;
       $("file").onchange = (e) => {
         const f = e.target.files?.[0];
         if (!f) return;
+        if (imageURL) URL.revokeObjectURL(imageURL);
         imageURL = URL.createObjectURL(f);
+        imageReady = false;
         const img = $("preview");
+        img.onload = () => {
+          imageReady = true;
+          setReadyState();
+        };
+        img.onerror = () => {
+          imageReady = false;
+          $("out").textContent = "圖片載入失敗，請重新選擇。";
+          setReadyState();
+        };
         img.src = imageURL;
         img.style.display = "block";
-        $("run").disabled = !model;
+        setReadyState();
       };
 
       let model = null;
       let processor = null;
+      let loading = false;
+      let running = false;
+
+      const setReadyState = () => {
+        $("load").disabled = loading || !!(model && processor);
+        $("run").disabled = loading || running || !(model && processor && imageReady && imageURL);
+      };
+
+      const createProgressTracker = () => {
+        const files = new Map();
+        let displayedPct = 0;
+        return (p) => {
+          const file = p.file || p.name || "model";
+          if ((p.status === "progress" || p.status === "done") && p.total) {
+            const current = files.get(file) || { loaded: 0, total: p.total };
+            const loaded = p.status === "done" ? p.total : p.loaded || current.loaded;
+            files.set(file, { loaded, total: p.total });
+            const totals = [...files.values()].reduce(
+              (acc, item) => ({
+                loaded: acc.loaded + Math.min(item.loaded, item.total),
+                total: acc.total + item.total,
+              }),
+              { loaded: 0, total: 0 },
+            );
+            if (totals.total > 0) {
+              const pct = Math.round((totals.loaded / totals.total) * 100);
+              displayedPct = Math.max(displayedPct, Math.min(pct, 99));
+              $("barfill").style.width = displayedPct + "%";
+              $("loadmsg").textContent = `下載模型 ${displayedPct}% (${(totals.loaded / 1048576).toFixed(0)}/${(totals.total / 1048576).toFixed(0)} MB，${files.size} 個檔案)`;
+            }
+          } else if (p.status === "ready") {
+            $("loadmsg").textContent = "模型就緒。";
+          } else if (p.status === "initiate" || p.status === "download") {
+            $("loadmsg").textContent = `準備模型檔案 ${file}...`;
+          }
+        };
+      };
 
       $("load").onclick = async () => {
-        $("load").disabled = true;
+        if (loading || (model && processor)) return;
+        loading = true;
+        setReadyState();
         const t0 = performance.now();
         try {
-          const progress = (p) => {
-            if (p.status === "progress" && p.total) {
-              const pct = Math.round((p.loaded / p.total) * 100);
-              $("barfill").style.width = pct + "%";
-              $("loadmsg").textContent = `下載 ${p.file || ""} … ${pct}% (${(p.loaded / 1048576).toFixed(0)}/${(p.total / 1048576).toFixed(0)} MB)`;
-            } else if (p.status === "ready") {
-              $("loadmsg").textContent = "模型就緒。";
-            }
-          };
+          await serviceWorkerReady;
+          const progress = createProgressTracker();
           const dtype = hasGPU
             ? { vision_encoder: "fp16", embed_tokens: "fp16", decoder_model_merged: "q4" }
             : { vision_encoder: "q4", embed_tokens: "q8", decoder_model_merged: "q4" };
@@ -123,19 +177,25 @@
             dtype,
             progress_callback: progress,
           });
-          processor = await AutoProcessor.from_pretrained(MODEL_ID);
+          processor = await AutoProcessor.from_pretrained(MODEL_ID, {
+            progress_callback: progress,
+          });
           $("barfill").style.width = "100%";
           $("loadmsg").innerHTML = `<span class="ok">✔ 載入完成（${((performance.now() - t0) / 1000).toFixed(1)}s）</span>`;
-          $("run").disabled = !imageURL;
         } catch (err) {
+          model = null;
+          processor = null;
           $("loadmsg").innerHTML = `<span class="err">✗ 載入失敗：${err?.message || err}</span>`;
-          $("load").disabled = false;
+        } finally {
+          loading = false;
+          setReadyState();
         }
       };
 
       $("run").onclick = async () => {
-        if (!model || !imageURL) return;
-        $("run").disabled = true;
+        if (!model || !processor || !imageURL || !imageReady || running) return;
+        running = true;
+        setReadyState();
         $("out").textContent = "辨識中…";
         const t0 = performance.now();
         try {
@@ -153,9 +213,16 @@
           $("timing").textContent = `推理耗時 ${((performance.now() - t0) / 1000).toFixed(1)}s`;
         } catch (err) {
           $("out").textContent = "✗ 執行失敗：" + (err?.message || err);
+        } finally {
+          running = false;
+          setReadyState();
         }
-        $("run").disabled = false;
       };
+
+      setReadyState();
     </script>
   </body>
 </html>
+
+
+
